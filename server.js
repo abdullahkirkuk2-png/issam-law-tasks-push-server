@@ -4,9 +4,20 @@ import admin from "firebase-admin";
 const app = express();
 app.use(express.json({ limit: "1mb" }));
 
+// ===== CORS for Flutter Web / browsers =====
+app.use((req, res, next) => {
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader(
+    "Access-Control-Allow-Headers",
+    "Content-Type, x-api-key, Authorization"
+  );
+  res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+  if (req.method === "OPTIONS") return res.sendStatus(204);
+  next();
+});
+
 // ===== Helpers =====
 function getApiKey(req) {
-  // Accept either x-api-key or key (for easier testing)
   return req.headers["x-api-key"] || req.headers["key"] || "";
 }
 
@@ -23,9 +34,6 @@ function initFirebaseOnce() {
   if (firebaseInited) return;
 
   const raw = mustEnv("FIREBASE_SERVICE_ACCOUNT_JSON");
-
-  // FIREBASE_SERVICE_ACCOUNT_JSON is stored as JSON in Render (type JSON),
-  // but in Node it still comes as a string. Parse it.
   const serviceAccount = typeof raw === "string" ? JSON.parse(raw) : raw;
 
   admin.initializeApp({
@@ -44,8 +52,6 @@ app.get("/", (req, res) => {
   });
 });
 
-// POST /send
-// Body: { to: "<FCM_TOKEN>", title: "Test", body: "Hello", data?: {..} }
 app.post("/send", async (req, res) => {
   try {
     const apiKey = getApiKey(req);
@@ -69,7 +75,6 @@ app.post("/send", async (req, res) => {
         title: title || "Notification",
         body: body || "",
       },
-      // optional custom data (must be string values)
       data: data
         ? Object.fromEntries(
             Object.entries(data).map(([k, v]) => [k, String(v)])
@@ -78,7 +83,6 @@ app.post("/send", async (req, res) => {
     };
 
     const id = await admin.messaging().send(message);
-
     return res.json({ ok: true, id });
   } catch (e) {
     return res.status(500).json({
