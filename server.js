@@ -1,43 +1,34 @@
 import express from "express";
+import cors from "cors";
 import admin from "firebase-admin";
 
 const app = express();
-app.use(express.json({ limit: "1mb" }));
+app.use(cors());
+app.use(express.json({ limit: "2mb" }));
 
-// --- Small CORS (بدون مكتبة cors) ---
-app.use((req, res, next) => {
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type, x-api-key, key");
-  res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
-  if (req.method === "OPTIONS") return res.status(204).end();
-  next();
-});
-
-// --- Helpers ---
+// ========= Helpers =========
 function mustEnv(name) {
   const v = process.env[name];
-  if (!v) throw new Error(`Missing env: ${name}`);
-  return v;
+  if (!v || !String(v).trim()) throw new Error(`Missing env: ${name}`);
+  return String(v);
 }
 
 function getApiKey(req) {
-  // نقبل أكثر من شكل حتى ما تلخبط:
-  // Header: x-api-key أو key
-  // Query: ?key=
-  return (
-    req.headers["x-api-key"] ||
-    req.headers["key"] ||
-    req.query.key ||
-    ""
-  );
+  const h = req.headers["x-api-key"] || req.headers["key"] || req.query.key || "";
+  return String(h).trim();
 }
 
 let firebaseReady = false;
 function initFirebaseOnce() {
   if (firebaseReady) return;
 
-  const saRaw = mustEnv("FIREBASE_SERVICE_ACCOUNT_JSON");
-  const serviceAccount = JSON.parse(saRaw);
+  const raw = mustEnv("FIREBASE_SERVICE_ACCOUNT_JSON");
+  let serviceAccount;
+  try {
+    serviceAccount = JSON.parse(raw);
+  } catch {
+    throw new Error("FIREBASE_SERVICE_ACCOUNT_JSON is not valid JSON");
+  }
 
   admin.initializeApp({
     credential: admin.credential.cert(serviceAccount),
@@ -47,114 +38,135 @@ function initFirebaseOnce() {
   firebaseReady = true;
 }
 
-function toStringMap(obj) {
-  // FCM data لازم تكون Strings
+function toStringMap(data) {
   const out = {};
-  if (!obj || typeof obj !== "object") return out;
-  for (const [k, v] of Object.entries(obj)) {
-    out[String(k)] = typeof v === "string" ? v : JSON.stringify(v);
-  }
+  if (!data || typeof data !== "object") return out;
+  for (const [k, v] of Object.entries(data)) out[String(k)] = String(v);
   return out;
 }
 
-// --- Routes ---
+async function sendMulticast(tokens, title, body, data) {
+  initFirebaseOnce();
+
+  const uniq = [...new Set(tokens.filter(Boolean).map(String))];
+  if (uniq.length === 0) return { ok: false, error: "No tokens" };
+
+  const chunks = [];
+  for (let i = 0; i < uniq.length; i += 500) chunks.push(uniq.slice(i, i + 500));
+
+  let success = 0;
+  let failure = 0;
+
+  for (const ch of chunks) {
+    const r = await admin.messaging().sendEachForMulticast({
+      tokens: ch,
+      notification: { title: String(title || "Notification"), body: String(body || "") },
+      data: toStringMap(data),
+      android: { priority: "high" },
+    });
+    success += r.successCount || 0;
+    failure += r.failureCount || 0;
+  }
+
+  return { ok: true, total: uniq.length, success, failure };
+}
+
+// ========= Routes =========
 app.get("/", (req, res) => {
-  res.json({
-    ok: true,
-    service: "issam-law-tasks-push-server",
-    now: new Date().toISOString(),
-  });
+  res.json({ ok: true, service: "issam-law-tasks-push-server", now: new Date().toISOString() });
 });
 
-// إرسال لتوكن واحد
+// 1) إرسال لتوكن واحد (للاختبار)
 app.post("/send", async (req, res) => {
   try {
     const apiKey = getApiKey(req);
     const expected = mustEnv("API_KEY");
-    if (!apiKey || apiKey !== expected) {
-      return res.status(401).json({ ok: false, error: "Unauthorized" });
-    }
+    if (!apiKey || apiKey !== expected) return res.status(401).json({ ok: false, error: "Unauthorized" });
 
     initFirebaseOnce();
 
     const { to, title, body, data } = req.body || {};
-    if (!to || typeof to !== "string") {
-      return res.status(400).json({ ok: false, error: "Missing 'to' token" });
-    }
+    if (!to || typeof to !== "string") return res.status(400).json({ ok: false, error: "Missing 'to' token" });
 
-    const msg = {
+    const id = await admin.messaging().send({
       token: to,
-      notification: {
-        title: title || "Notification",
-        body: body || "",
-      },
+      notification: { title: String(title || "Notification"), body: String(body || "") },
       data: toStringMap(data),
-    };
+      android: { priority: "high" },
+    });
 
-    const id = await admin.messaging().send(msg);
     return res.json({ ok: true, messageId: id });
   } catch (e) {
-    return res.status(500).json({ ok: false, error: String(e.message || e) });
+    return res.status(500).json({ ok: false, error: String(e?.message || e) });
   }
 });
 
-// إرسال لكل الأدمن (حسب fcm_tokens.role == "admin")
+// 2) إرسال لكل الأدمنية (يعتمد على fcm_tokens.role == "admin")
 app.post("/send_admins", async (req, res) => {
   try {
     const apiKey = getApiKey(req);
     const expected = mustEnv("API_KEY");
-    if (!apiKey || apiKey !== expected) {
-      return res.status(401).json({ ok: false, error: "Unauthorized" });
-    }
+    if (!apiKey || apiKey !== expected) return res.status(401).json({ ok: false, error: "Unauthorized" });
 
     initFirebaseOnce();
 
-    const { title, body, data, excludeUid, excludeEmail } = req.body || {};
+    const { title, body, data, excludeEmail, excludeUid } = req.body || {};
 
-    const snap = await admin
-      .firestore()
-      .collection("fcm_tokens")
-      .where("role", "==", "admin")
-      .get();
+    const snap = await admin.firestore().collection("fcm_tokens").where("role", "==", "admin").get();
 
-    let tokens = [];
+    const tokens = [];
     snap.forEach((doc) => {
       const d = doc.data() || {};
-      const t = d.token;
-      const uid = d.uid;
-      const email = d.email;
-
-      if (excludeUid && uid === excludeUid) return;
-      if (excludeEmail && email === excludeEmail) return;
-
-      if (t && typeof t === "string") tokens.push(t);
+      if (excludeEmail && String(d.email || "").toLowerCase() === String(excludeEmail).toLowerCase()) return;
+      if (excludeUid && String(d.uid || "") === String(excludeUid)) return;
+      if (d.token) tokens.push(String(d.token));
     });
 
-    // إزالة التكرار
-    tokens = [...new Set(tokens)];
+    const r = await sendMulticast(tokens, title || "Admin", body || "", data || {});
+    return res.json(r);
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+  }
+});
 
-    if (tokens.length === 0) {
-      return res.json({ ok: true, total: 0, success: 0, failure: 0 });
+// 3) ✅ الجديد: إرسال حسب usernames (للمهام الفردية/الكروب)
+// Body مثال:
+// { "usernames":["ali","ahmed"], "title":"...", "body":"...", "data":{...} }
+app.post("/send_usernames", async (req, res) => {
+  try {
+    const apiKey = getApiKey(req);
+    const expected = mustEnv("API_KEY");
+    if (!apiKey || apiKey !== expected) return res.status(401).json({ ok: false, error: "Unauthorized" });
+
+    initFirebaseOnce();
+
+    const { usernames, title, body, data } = req.body || {};
+    if (!Array.isArray(usernames) || usernames.length === 0) {
+      return res.status(400).json({ ok: false, error: "Missing usernames[]" });
     }
 
-    const multicast = {
-      tokens,
-      notification: {
-        title: title || "Admin Chat",
-        body: body || "New message",
-      },
-      data: toStringMap(data),
-    };
+    // normalize usernames to lowercase
+    const list = [...new Set(usernames.map(u => String(u || "").trim().toLowerCase()).filter(Boolean))];
+    if (list.length === 0) return res.status(400).json({ ok: false, error: "Empty usernames[]" });
 
-    const r = await admin.messaging().sendEachForMulticast(multicast);
-    return res.json({
-      ok: true,
-      total: tokens.length,
-      success: r.successCount,
-      failure: r.failureCount,
-    });
+    const db = admin.firestore();
+    const col = db.collection("fcm_tokens");
+
+    const tokens = [];
+    // Firestore IN limit = 10
+    for (let i = 0; i < list.length; i += 10) {
+      const chunk = list.slice(i, i + 10);
+      const snap = await col.where("username", "in", chunk).get();
+      snap.forEach(doc => {
+        const d = doc.data() || {};
+        if (d.token) tokens.push(String(d.token));
+      });
+    }
+
+    const r = await sendMulticast(tokens, title || "Task", body || "", data || {});
+    return res.json(r);
   } catch (e) {
-    return res.status(500).json({ ok: false, error: String(e.message || e) });
+    return res.status(500).json({ ok: false, error: String(e?.message || e) });
   }
 });
 
