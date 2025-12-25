@@ -1,60 +1,72 @@
 import express from "express";
-import cors from "cors";
 import admin from "firebase-admin";
 
 const app = express();
-
-app.use(cors());
 app.use(express.json({ limit: "1mb" }));
 
+// --- Small CORS (بدون مكتبة cors) ---
+app.use((req, res, next) => {
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, x-api-key, key");
+  res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+  if (req.method === "OPTIONS") return res.status(204).end();
+  next();
+});
+
+// --- Helpers ---
 function mustEnv(name) {
   const v = process.env[name];
-  if (!v || !v.trim()) throw new Error(`Missing env var: ${name}`);
-  return v.trim();
+  if (!v) throw new Error(`Missing env: ${name}`);
+  return v;
 }
 
 function getApiKey(req) {
+  // نقبل أكثر من شكل حتى ما تلخبط:
+  // Header: x-api-key أو key
+  // Query: ?key=
   return (
-    req.get("x-api-key") ||
-    req.get("X-API-KEY") ||
-    req.get("x-api_key") ||
-    req.get("api-key") ||
+    req.headers["x-api-key"] ||
+    req.headers["key"] ||
+    req.query.key ||
     ""
-  ).trim();
+  );
 }
 
-let firebaseInited = false;
-
+let firebaseReady = false;
 function initFirebaseOnce() {
-  if (firebaseInited) return;
+  if (firebaseReady) return;
 
-  const raw = mustEnv("FIREBASE_SERVICE_ACCOUNT_JSON");
-  let creds;
-  try {
-    creds = JSON.parse(raw);
-  } catch (e) {
-    throw new Error("FIREBASE_SERVICE_ACCOUNT_JSON is not valid JSON");
-  }
+  const saRaw = mustEnv("FIREBASE_SERVICE_ACCOUNT_JSON");
+  const serviceAccount = JSON.parse(saRaw);
 
   admin.initializeApp({
-    credential: admin.credential.cert(creds),
+    credential: admin.credential.cert(serviceAccount),
+    projectId: process.env.FIREBASE_PROJECT_ID || serviceAccount.project_id,
   });
 
-  firebaseInited = true;
+  firebaseReady = true;
 }
 
-function normalizeData(data) {
+function toStringMap(obj) {
+  // FCM data لازم تكون Strings
   const out = {};
-  if (!data || typeof data !== "object") return out;
-  for (const [k, v] of Object.entries(data)) out[k] = String(v);
+  if (!obj || typeof obj !== "object") return out;
+  for (const [k, v] of Object.entries(obj)) {
+    out[String(k)] = typeof v === "string" ? v : JSON.stringify(v);
+  }
   return out;
 }
 
+// --- Routes ---
 app.get("/", (req, res) => {
-  res.json({ ok: true, service: "issam-law-tasks-push-server", now: new Date().toISOString() });
+  res.json({
+    ok: true,
+    service: "issam-law-tasks-push-server",
+    now: new Date().toISOString(),
+  });
 });
 
-// ✅ إرسال لتوكن واحد (مثل اللي مجربه)
+// إرسال لتوكن واحد
 app.post("/send", async (req, res) => {
   try {
     const apiKey = getApiKey(req);
@@ -70,23 +82,23 @@ app.post("/send", async (req, res) => {
       return res.status(400).json({ ok: false, error: "Missing 'to' token" });
     }
 
-    const message = {
+    const msg = {
       token: to,
       notification: {
-        title: (title ?? "تنبيه").toString(),
-        body: (body ?? "").toString(),
+        title: title || "Notification",
+        body: body || "",
       },
-      data: normalizeData(data),
+      data: toStringMap(data),
     };
 
-    const id = await admin.messaging().send(message);
-    return res.json({ ok: true, id });
+    const id = await admin.messaging().send(msg);
+    return res.json({ ok: true, messageId: id });
   } catch (e) {
-    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+    return res.status(500).json({ ok: false, error: String(e.message || e) });
   }
 });
 
-// ✅ إرسال لكل الأدمنات (role == 'admin') من fcm_tokens
+// إرسال لكل الأدمن (حسب fcm_tokens.role == "admin")
 app.post("/send_admins", async (req, res) => {
   try {
     const apiKey = getApiKey(req);
@@ -97,7 +109,7 @@ app.post("/send_admins", async (req, res) => {
 
     initFirebaseOnce();
 
-    const { title, body, data } = req.body || {};
+    const { title, body, data, excludeUid, excludeEmail } = req.body || {};
 
     const snap = await admin
       .firestore()
@@ -105,42 +117,46 @@ app.post("/send_admins", async (req, res) => {
       .where("role", "==", "admin")
       .get();
 
-    const tokens = Array.from(
-      new Set(
-        snap.docs
-          .map((d) => (d.data()?.token ?? "").toString().trim())
-          .filter((t) => t.length > 0)
-      )
-    );
+    let tokens = [];
+    snap.forEach((doc) => {
+      const d = doc.data() || {};
+      const t = d.token;
+      const uid = d.uid;
+      const email = d.email;
+
+      if (excludeUid && uid === excludeUid) return;
+      if (excludeEmail && email === excludeEmail) return;
+
+      if (t && typeof t === "string") tokens.push(t);
+    });
+
+    // إزالة التكرار
+    tokens = [...new Set(tokens)];
 
     if (tokens.length === 0) {
-      return res.status(404).json({ ok: false, error: "No admin tokens found" });
+      return res.json({ ok: true, total: 0, success: 0, failure: 0 });
     }
 
-    const message = {
+    const multicast = {
       tokens,
       notification: {
-        title: (title ?? "رسالة للأدمن").toString(),
-        body: (body ?? "").toString(),
+        title: title || "Admin Chat",
+        body: body || "New message",
       },
-      data: normalizeData(data),
+      data: toStringMap(data),
     };
 
-    // firebase-admin v13 يدعم sendEachForMulticast
-    const resp = await admin.messaging().sendEachForMulticast(message);
-
+    const r = await admin.messaging().sendEachForMulticast(multicast);
     return res.json({
       ok: true,
       total: tokens.length,
-      success: resp.successCount,
-      failure: resp.failureCount,
+      success: r.successCount,
+      failure: r.failureCount,
     });
   } catch (e) {
-    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+    return res.status(500).json({ ok: false, error: String(e.message || e) });
   }
 });
 
 const port = process.env.PORT || 10000;
-app.listen(port, () => {
-  console.log("Server listening on:", port);
-});
+app.listen(port, () => console.log("Server listening on", port));
